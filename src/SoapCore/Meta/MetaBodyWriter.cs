@@ -5,8 +5,11 @@ using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Runtime.Serialization;
 using System.ServiceModel;
 using System.ServiceModel.Channels;
+using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Xml;
 using System.Xml.Schema;
@@ -32,8 +35,37 @@ namespace SoapCore.Meta
 		private readonly HashSet<string> _builtEnumTypes;
 		private readonly HashSet<string> _builtComplexTypes;
 		private readonly Dictionary<string, Dictionary<string, string>> _requestedDynamicTypes;
+		private readonly Dictionary<string, HashSet<string>> _nsDependencies = new();
+
+		private string _currentNs;
+		private Dictionary<Type, string> _typeNsMapping;
+		private Dictionary<string, string> _nsPrefix;
 
 		private bool _buildMicrosoftGuid = false;
+
+		private static void GetChildTypesInternal(Type t, HashSet<Type> s)
+		{
+			if (t.IsPrimitive || !s.Add(t))
+			{
+				return;
+			}
+
+			foreach (var p in t.GetProperties())
+			{
+				s.Add(p.PropertyType);
+				GetChildTypesInternal(p.PropertyType, s);
+			}
+		}
+
+		private static IEnumerable<Type> GetChildTypes(Type t)
+		{
+			HashSet<Type> retval = new();
+
+			GetChildTypesInternal(t, retval);
+
+			return retval;
+		}
+
 
 		[Obsolete]
 		public MetaBodyWriter(ServiceDescription service, string baseUrl, Binding binding, XmlNamespaceManager xmlNamespaceManager = null)
@@ -234,6 +266,33 @@ namespace SoapCore.Meta
 			return new XmlQualifiedName(resolvedType, Namespaces.XMLNS_XSD);
 		}
 
+		private string GetPrefixForType(Type t, bool updateNsDeps = true)
+		{
+			var nsPrefix = "tns";
+
+			if (_typeNsMapping.TryGetValue(t, out var ns) && ns != null)
+			{
+				nsPrefix = _xmlNamespaceManager.LookupPrefix(ns);
+			}
+
+			if (updateNsDeps)
+			{
+				if (!_nsDependencies.TryGetValue(_currentNs, out var _))
+				{
+					_nsDependencies[_currentNs] = new HashSet<string>();
+				}
+
+				if (nsPrefix != _currentNs)
+				{
+					_nsDependencies[_currentNs].Add(nsPrefix);
+				}
+			}
+
+			return nsPrefix;
+		}
+
+		private string GetPrefixedTypeName(Type t) => $"{GetPrefixForType(t)}:{t.Name}";
+
 		private void WriteParameters(XmlDictionaryWriter writer, SoapMethodParameterInfo[] parameterInfos, bool isMessageContract)
 		{
 			var hasWrittenSchema = false;
@@ -260,7 +319,7 @@ namespace SoapCore.Meta
 				{
 					if (TryGetMessageContractBodyType(parameterInfo.Parameter.ParameterType, out var messageBodyType))
 					{
-						writer.WriteAttributeString("type", "tns:" + messageBodyType.Name);
+						writer.WriteAttributeString("type", GetPrefixedTypeName(messageBodyType));
 						_complexTypeToBuild.Enqueue(new TypeToBuild(messageBodyType));
 					}
 				}
@@ -292,33 +351,53 @@ namespace SoapCore.Meta
 
 		private void AddTypes(XmlDictionaryWriter writer)
 		{
-			writer.WriteStartElement("wsdl", "types", Namespaces.WSDL_NS);
-			writer.WriteStartElement("schema", Namespaces.XMLNS_XSD);
-			writer.WriteAttributeString("elementFormDefault", "qualified");
-			writer.WriteAttributeString("targetNamespace", TargetNameSpace);
+			_typeNsMapping = _service.Operations.SelectMany(y =>
+					y.DispatchMethod.GetParameters().Select(p => p.ParameterType).Union([y.DispatchMethod.ReturnType]))
+					.SelectMany(GetChildTypes)
+					.Distinct()
+					.ToDictionary(
+						k => k,
+						v => v.GetCustomAttribute<XmlTypeAttribute>()?.Namespace ??
+							 v.GetCustomAttribute<DataContractAttribute>()?.Namespace);
+
+			int i = 0;
+			foreach (var ns in (from x in _typeNsMapping.Values where x is not null select x).Distinct())
+			{
+				if (ns != TargetNameSpace)
+				{
+					_xmlNamespaceManager.AddNamespace("s" + (++i), ns);
+				}
+			}
+
+			var ms0 = new MemoryStream();
+			var w0 = XmlDictionaryWriter.CreateTextWriter(ms0, Encoding.UTF8);
+
+			var writers = new Dictionary<string, (MemoryStream Stream, XmlDictionaryWriter Writer)> { ["tns"] = (ms0, w0) };
+
+			_currentNs = "tns";
 
 			foreach (var operation in _service.Operations)
 			{
 				bool hasWrittenOutParameters = false;
 
 				// input parameters of operation
-				writer.WriteStartElement("element", Namespaces.XMLNS_XSD);
-				writer.WriteAttributeString("name", GetOuterInputElementName(operation));
+				w0.WriteStartElement("element", Namespaces.XMLNS_XSD);
+				w0.WriteAttributeString("name", GetOuterInputElementName(operation));
 
 				if (!operation.IsMessageContractRequest && operation.InParameters.Length == 0)
 				{
-					writer.WriteStartElement("complexType", Namespaces.XMLNS_XSD);
-					writer.WriteEndElement();
+					w0.WriteStartElement("complexType", Namespaces.XMLNS_XSD);
+					w0.WriteEndElement();
 				}
 				else
 				{
-					WriteParameters(writer, operation.InParameters, operation.IsMessageContractRequest);
+					WriteParameters(w0, operation.InParameters, operation.IsMessageContractRequest);
 				}
 
-				writer.WriteEndElement(); // element
+				w0.WriteEndElement(); // element
 
 				// output parameter / return of operation
-				writer.WriteStartElement("element", Namespaces.XMLNS_XSD);
+				w0.WriteStartElement("element", Namespaces.XMLNS_XSD);
 				string responseName = operation.Name + "Response";
 				if (operation.IsMessageContractRequest && operation.InParameters.Length > 0)
 				{
@@ -328,7 +407,7 @@ namespace SoapCore.Meta
 					}
 				}
 
-				writer.WriteAttributeString("name", responseName);
+				w0.WriteAttributeString("name", responseName);
 
 				if (operation.DispatchMethod.ReturnType != typeof(void) && operation.DispatchMethod.ReturnType != typeof(Task))
 				{
@@ -359,28 +438,28 @@ namespace SoapCore.Meta
 										?? typeRootName
 										?? operation.Name + "Result";
 
-						writer.WriteStartElement("complexType", Namespaces.XMLNS_XSD);
-						writer.WriteStartElement("sequence", Namespaces.XMLNS_XSD);
+						w0.WriteStartElement("complexType", Namespaces.XMLNS_XSD);
+						w0.WriteStartElement("sequence", Namespaces.XMLNS_XSD);
 
 						if (operation.ReturnsChoice)
 						{
-							AddChoice(writer, operation.ReturnChoices);
+							AddChoice(w0, operation.ReturnChoices);
 						}
 						else
 						{
-							AddSchemaType(writer, returnType, returnName, isUnqualified: isUnqualified);
+							AddSchemaType(w0, returnType, returnName, isUnqualified: isUnqualified);
 						}
 
 						//Add all outParameters to the complexType
 						foreach (var outParameter in operation.OutParameters)
 						{
-							WriteParameterElement(writer, outParameter);
+							WriteParameterElement(w0, outParameter);
 						}
 
 						hasWrittenOutParameters = true;
 
-						writer.WriteEndElement();
-						writer.WriteEndElement();
+						w0.WriteEndElement();
+						w0.WriteEndElement();
 					}
 					else
 					{
@@ -388,11 +467,11 @@ namespace SoapCore.Meta
 
 						if (returnType.IsConstructedGenericType)
 						{
-							writer.WriteAttributeString("type", Namespaces.XMLNS_XSD + type.Name);
+							w0.WriteAttributeString("type", Namespaces.XMLNS_XSD + type.Name);
 						}
 						else
 						{
-							writer.WriteAttributeString("type", "tns:" + type.Name);
+							w0.WriteAttributeString("type", GetPrefixedTypeName(type));
 							_complexTypeToBuild.Enqueue(new TypeToBuild(type));
 						}
 					}
@@ -401,30 +480,30 @@ namespace SoapCore.Meta
 				{
 					if (!operation.IsMessageContractResponse)
 					{
-						writer.WriteStartElement("complexType", Namespaces.XMLNS_XSD);
+						w0.WriteStartElement("complexType", Namespaces.XMLNS_XSD);
 
 						if (operation.OutParameters.Length > 0)
 						{
-							writer.WriteStartElement("sequence", Namespaces.XMLNS_XSD);
+							w0.WriteStartElement("sequence", Namespaces.XMLNS_XSD);
 							foreach (var outParameter in operation.OutParameters)
 							{
-								WriteParameterElement(writer, outParameter);
+								WriteParameterElement(w0, outParameter);
 							}
 
 							hasWrittenOutParameters = true;
-							writer.WriteEndElement();
+							w0.WriteEndElement();
 						}
 
-						writer.WriteEndElement();
+						w0.WriteEndElement();
 					}
 				}
 
 				if (!hasWrittenOutParameters)
 				{
-					WriteParameters(writer, operation.OutParameters, operation.IsMessageContractResponse);
+					WriteParameters(w0, operation.OutParameters, operation.IsMessageContractResponse);
 				}
 
-				writer.WriteEndElement(); // element
+				w0.WriteEndElement(); // element
 
 				foreach (var faultType in operation.Faults)
 				{
@@ -434,18 +513,27 @@ namespace SoapCore.Meta
 					_complexTypeToBuild.Enqueue(faultTypeToBuild);
 
 					//write element pendant for the fault type
-					writer.WriteStartElement("element", Namespaces.XMLNS_XSD);
-					writer.WriteAttributeString("name", EnsureFaultNaming(faultTypeToBuild.TypeName));
-					writer.WriteAttributeString("nillable", "true");
-					writer.WriteAttributeString("type", "tns:" + faultTypeToBuild.TypeName);
-					writer.WriteEndElement(); // element
+					w0.WriteStartElement("element", Namespaces.XMLNS_XSD);
+					w0.WriteAttributeString("name", EnsureFaultNaming(faultTypeToBuild.TypeName));
+					w0.WriteAttributeString("nillable", "true");
+					w0.WriteAttributeString("type", GetPrefixedTypeName(faultTypeToBuild.Type));
+					w0.WriteEndElement(); // element
 				}
 			}
 
 			while (_complexTypeToBuild.Count > 0)
 			{
 				var toBuild = _complexTypeToBuild.Dequeue();
-				AddSchemaComplexType(writer, toBuild);
+				var ns = GetPrefixForType(toBuild.Type, updateNsDeps: false);
+				_currentNs = ns;
+
+				if (!writers.TryGetValue(ns, out var nsWriter))
+				{
+					var ms = new MemoryStream();
+					writers[ns] = (ms, XmlDictionaryWriter.CreateTextWriter(ms, Encoding.UTF8));
+				}
+
+				AddSchemaComplexType(writers[ns].Writer, toBuild);
 			}
 
 			while (_enumToBuild.Count > 0)
@@ -456,14 +544,23 @@ namespace SoapCore.Meta
 					toBuild = toBuild.GetElementType();
 				}
 
+				var ns = GetPrefixForType(toBuild, updateNsDeps: false);
+				_currentNs = ns;
+
+				if (!writers.TryGetValue(ns, out var nsWriter))
+				{
+					var ms = new MemoryStream();
+					writers[ns] = (ms, XmlDictionaryWriter.CreateTextWriter(ms, Encoding.UTF8));
+				}
+
 				var typeName = toBuild.GetSerializedTypeName();
 
 				if (!_builtEnumTypes.Contains(toBuild.Name))
 				{
-					writer.WriteStartElement("simpleType", Namespaces.XMLNS_XSD);
-					writer.WriteAttributeString("name", typeName);
-					writer.WriteStartElement("restriction", Namespaces.XMLNS_XSD);
-					writer.WriteAttributeString("base", $"{_xmlNamespaceManager.LookupPrefix(Namespaces.XMLNS_XSD)}:string");
+					writers[ns].Writer.WriteStartElement("simpleType", Namespaces.XMLNS_XSD);
+					writers[ns].Writer.WriteAttributeString("name", typeName);
+					writers[ns].Writer.WriteStartElement("restriction", Namespaces.XMLNS_XSD);
+					writers[ns].Writer.WriteAttributeString("base", $"{_xmlNamespaceManager.LookupPrefix(Namespaces.XMLNS_XSD)}:string");
 
 					// enum values are ordered by the order in which they are specified in the source code.
 					var orderedNames = toBuild.GetFields().Where(fi => fi.IsStatic).OrderBy(fi => fi.MetadataToken).Select(fi => fi.Name);
@@ -489,44 +586,56 @@ namespace SoapCore.Meta
 												 };
 					foreach (var member in membersWithCustomNames)
 					{
-						writer.WriteStartElement("enumeration", Namespaces.XMLNS_XSD);
-						writer.WriteAttributeString("value", member.CustomName ?? member.Name);
-						writer.WriteEndElement(); // enumeration
+						writers[ns].Writer.WriteStartElement("enumeration", Namespaces.XMLNS_XSD);
+						writers[ns].Writer.WriteAttributeString("value", member.CustomName ?? member.Name);
+						writers[ns].Writer.WriteEndElement(); // enumeration
 					}
 
-					writer.WriteEndElement(); // restriction
-					writer.WriteEndElement(); // simpleType
+					writers[ns].Writer.WriteEndElement(); // restriction
+					writers[ns].Writer.WriteEndElement(); // simpleType
 
 					_builtEnumTypes.Add(toBuild.Name);
 				}
 			}
 
-			writer.WriteEndElement(); // schema
+			foreach (var item in _typeNsMapping.Values.Distinct().Where(x => x is not null && x != TargetNameSpace))
+			{
+				writer.WriteAttributeString("xmlns", _xmlNamespaceManager.LookupPrefix(item), null, item);
+			}
 
-			if (_buildMicrosoftGuid)
+			writer.WriteStartElement("wsdl", "types", Namespaces.WSDL_NS);
+
+			foreach (var w in writers)
 			{
 				writer.WriteStartElement("schema", Namespaces.XMLNS_XSD);
 				writer.WriteAttributeString("elementFormDefault", "qualified");
-				writer.WriteAttributeString("targetNamespace", Namespaces.MICROSOFT_TYPES);
+				writer.WriteAttributeString("targetNamespace", _xmlNamespaceManager.LookupNamespace(w.Key));
 
-				writer.WriteStartElement("simpleType", Namespaces.XMLNS_XSD);
-				writer.WriteAttributeString("name", "guid");
+				if (_nsDependencies.TryGetValue(w.Key, out var deps))
+				{
+					//foreach (var nsDep in deps)
+					//{
+					//	if (nsDep != "tns")
+					//	{
+					//		writer.WriteAttributeString("xmlns", nsDep, null, _xmlNamespaceManager.LookupNamespace(nsDep));
+					//	}
+					//}
 
-				writer.WriteStartElement("restriction", Namespaces.XMLNS_XSD);
-				writer.WriteAttributeString("base", $"{_xmlNamespaceManager.LookupPrefix(Namespaces.XMLNS_XSD)}:string");
+					foreach (var nsDep in deps)
+					{
+						writer.WriteStartElement("import", Namespaces.XMLNS_XSD);
+						writer.WriteAttributeString("namespace", _xmlNamespaceManager.LookupNamespace(nsDep));
+						writer.WriteEndElement();
+					}
+				}
 
-				writer.WriteStartElement("pattern", Namespaces.XMLNS_XSD);
-				writer.WriteAttributeString("value", "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}");
-				writer.WriteEndElement(); // pattern
+				w.Value.Writer.Flush();
+				writer.WriteRaw(Encoding.UTF8.GetString(w.Value.Stream.ToArray()));
 
-				writer.WriteEndElement(); // restriction
-
-				writer.WriteEndElement(); // simpleType
-
-				writer.WriteEndElement(); // schema
+				writer.WriteEndElement();
 			}
 
-			writer.WriteEndElement(); // wsdl:types
+			writer.WriteEndElement();
 		}
 
 		private void AddMessage(XmlDictionaryWriter writer)
@@ -599,13 +708,13 @@ namespace SoapCore.Meta
 
 		private void AddMessageFaults(XmlDictionaryWriter writer, OperationDescription operation)
 		{
-			foreach (var faultName in operation.Faults.Select(f => f.Name).ToArray())
+			foreach (var fault in operation.Faults.ToArray())
 			{
 				writer.WriteStartElement("wsdl", "message", Namespaces.WSDL_NS);
-				writer.WriteAttributeString("name", $"{BindingType}_{operation.Name}_{EnsureFaultNaming(faultName)}_FaultMessage");
+				writer.WriteAttributeString("name", $"{BindingType}_{operation.Name}_{EnsureFaultNaming(fault.Name)}_FaultMessage");
 				writer.WriteStartElement("wsdl", "part", Namespaces.WSDL_NS);
 				writer.WriteAttributeString("name", "detail");
-				writer.WriteAttributeString("element", $"tns:{EnsureFaultNaming(faultName)}");
+				writer.WriteAttributeString("element", $"{GetPrefixForType(fault)}:{EnsureFaultNaming(fault.Name)}");
 				writer.WriteEndElement(); // wsdl:part
 				writer.WriteEndElement(); // wsdl:message
 			}
@@ -639,11 +748,11 @@ namespace SoapCore.Meta
 
 		private void AddOperationTypeFaults(XmlDictionaryWriter writer, OperationDescription operation)
 		{
-			foreach (var faultName in operation.Faults.Select(f => f.Name).ToArray())
+			foreach (var fault in operation.Faults.ToArray())
 			{
 				writer.WriteStartElement("wsdl", "fault", Namespaces.WSDL_NS);
-				writer.WriteAttributeString("name", $"{EnsureFaultNaming(faultName)}");
-				writer.WriteAttributeString("message", $"tns:{BindingType}_{operation.Name}_{EnsureFaultNaming(faultName)}_FaultMessage");
+				writer.WriteAttributeString("name", $"{EnsureFaultNaming(fault.Name)}");
+				writer.WriteAttributeString("message", $"{GetPrefixForType(fault)}:{BindingType}_{operation.Name}_{EnsureFaultNaming(fault.Name)}_FaultMessage");
 				writer.WriteEndElement(); // wsdl:fault
 			}
 		}
@@ -666,7 +775,7 @@ namespace SoapCore.Meta
 
 				writer.WriteStartElement("wsdl", "binding", Namespaces.WSDL_NS);
 				writer.WriteAttributeString("name", qualifiedBindingName);
-				writer.WriteAttributeString("type", "tns:" + BindingType);
+				writer.WriteAttributeString("type", "tns:" + BindingType); // TODO ?
 
 				writer.WriteStartElement(soap, "binding", soapNamespace);
 				writer.WriteAttributeString("transport", Namespaces.TRANSPORT_SCHEMA);
@@ -733,7 +842,7 @@ namespace SoapCore.Meta
 
 				writer.WriteStartElement("wsdl", "port", Namespaces.WSDL_NS);
 				writer.WriteAttributeString("name", qualifiedPortName);
-				writer.WriteAttributeString("binding", "tns:" + qualifiedBindingName);
+				writer.WriteAttributeString("binding", "tns:" + qualifiedBindingName); // TODO ?
 
 				writer.WriteStartElement(soap, "address", soapNamespace);
 
@@ -750,7 +859,7 @@ namespace SoapCore.Meta
 			var toBuildBodyType = GetMessageContractBodyType(toBuildType);
 			var isWrappedBodyType = IsWrappedMessageContractType(toBuildType);
 			var toBuildName = toBuild.TypeName;
-
+			
 			if (toBuild.IsAnonumous || !_builtComplexTypes.Contains(toBuildName))
 			{
 				writer.WriteStartElement("complexType", Namespaces.XMLNS_XSD);
@@ -843,7 +952,7 @@ namespace SoapCore.Meta
 					writer.WriteStartElement("element", Namespaces.XMLNS_XSD);
 					writer.WriteAttributeString("name", toBuildName);
 					writer.WriteAttributeString("nillable", "true");
-					writer.WriteAttributeString("type", "tns:" + toBuildName);
+					writer.WriteAttributeString("type", "tns:" + toBuildName); // TODO ?
 					writer.WriteEndElement(); // element
 				}
 
@@ -1129,7 +1238,7 @@ namespace SoapCore.Meta
 						writer.WriteAttributeString("nillable", "true");
 					}
 
-					writer.WriteAttributeString("type", "tns:" + newTypeToBuild.TypeName);
+					writer.WriteAttributeString("type", GetPrefixedTypeName(newTypeToBuild.Type));
 
 					_complexTypeToBuild.Enqueue(newTypeToBuild);
 				}
@@ -1159,7 +1268,7 @@ namespace SoapCore.Meta
 					}
 					else
 					{
-						writer.WriteAttributeString("type", "tns:" + newTypeToBuild.TypeName);
+						writer.WriteAttributeString("type", GetPrefixedTypeName(newTypeToBuild.Type));
 
 						_complexTypeToBuild.Enqueue(newTypeToBuild);
 					}
@@ -1179,7 +1288,8 @@ namespace SoapCore.Meta
 
 					writer.WriteAttributeString("name", name);
 					WriteQualification(writer, isUnqualified);
-					writer.WriteAttributeString("type", "tns:" + newTypeToBuild.TypeName);
+
+					writer.WriteAttributeString("type", GetPrefixedTypeName(newTypeToBuild.Type));
 
 					_complexTypeToBuild.Enqueue(newTypeToBuild);
 				}
